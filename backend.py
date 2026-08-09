@@ -344,6 +344,11 @@ def flight_agent(state: TravelState):
         )
         flight_data = response.content
     except Exception as exc:
+        print(
+            f"FLIGHT AGENT MCP ERROR: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
         flight_data = f"Flight information unavailable: {exc}"
 
     return {
