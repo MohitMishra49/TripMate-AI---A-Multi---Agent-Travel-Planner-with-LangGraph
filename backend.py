@@ -1,4 +1,51 @@
+"""
+backend_v2.py
+==============
+Production-style rewrite of backend.py.
+
+This is a NEW file. The original backend.py is untouched — swap the import
+in app.py (`from backend import ...` -> `from backend_v2 import ...`) once
+you've reviewed this and are ready to cut over, and adjust the routes to
+`await` the now-async entry points (see the notes at the bottom of this file).
+
+What changed vs. backend.py, and why, is explained in the chat response.
+Every change here maps directly to one of the 14 numbered requirements you
+gave me. Nothing in here fabricates flight prices, hotel prices, ratings,
+availability, or booking URLs — see AVIATIONSTACK CAPABILITY NOTE below.
+
+AVIATIONSTACK CAPABILITY NOTE (read this before assuming pricing works):
+Your mcp_client.py wires up the aviationstack-mcp server (Pradumnasaraf/
+aviationstack-mcp). Based on that server's documented tool set, it exposes
+reference/schedule data (list_airports, list_airlines, list_routes,
+historical_flights_by_date, airport schedules, flights_with_airline, etc.)
+via the free AviationStack API tier. It does NOT expose fare pricing,
+seat availability, or booking. There is no tool to invent here — the
+capability genuinely does not exist in this integration. This file uses
+list_routes / historical_flights_by_date (the two tools whose exact
+signatures I confirmed) for real route-specific data, and is explicit
+with the user, in the returned payload and in the final LLM prompt, that
+price/availability is not available and the booking link is a *search*
+link, not a quote.
+
+Tool discovery is done at RUNTIME against whatever the connected MCP
+server actually reports (`client.get_tools(server_name="aviationstack")`),
+rather than hardcoding tool names I can't verify against your installed
+version. If your server exposes additional/renamed tools, this code will
+pick up `list_routes` / `historical_flights_by_date` if present under
+those exact names, and will clearly report which ones it couldn't find.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import operator
 import os
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Any, TypedDict, Annotated
+
 import certifi
 from dotenv import load_dotenv
 
@@ -6,15 +53,10 @@ load_dotenv()
 os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 
-from typing import Any, TypedDict, Annotated
-import operator
-import uuid
-import asyncio
-import json
-import psycopg
 from psycopg.rows import dict_row
+from psycopg_pool import AsyncConnectionPool
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.types import Command, interrupt
 from langchain_core.messages import (
     AnyMessage,
@@ -24,434 +66,758 @@ from langchain_core.messages import (
 )
 from langchain_groq import ChatGroq
 
+from mcp_client import client as mcp_client, tavily_mcp_search, weather_mcp_search, forecast_mcp_search
 
-from mcp_client import (
-    tavily_mcp_search,
-    aviation_mcp_call,
-    extract_destination,
-    forecast_mcp_search,
-    weather_mcp_search,
-)
+try:
+    import airportsdata
+    _IATA_AIRPORTS = airportsdata.load("IATA")
+except Exception:  # pragma: no cover - defensive, airportsdata is a listed dependency
+    _IATA_AIRPORTS = {}
 
 
-def get_database_url():
+# =============================================================================
+# 1. Config / timeouts
+# =============================================================================
+
+# (Req #10) Nothing external gets to hang the whole request forever.
+LLM_TIMEOUT_SECONDS = 25
+MCP_TIMEOUT_SECONDS = 15
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY is missing. Please add it to your .env file.")
+
+
+def get_database_url() -> str:
     database_url = os.getenv("DATABASE_URL")
-
     if not database_url:
         raise ValueError(
             "DATABASE_URL is missing. "
             "Please add your Render PostgreSQL External Database URL to .env"
         )
-
     if "sslmode=" not in database_url:
         separator = "&" if "?" in database_url else "?"
         database_url = f"{database_url}{separator}sslmode=require"
-
     return database_url
 
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=GROQ_API_KEY)
 
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY is missing. Please add it to your .env file.")
 
-# =========================
-# LLM - original model kept
-# =========================
-llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
-    api_key=GROQ_API_KEY,
-)
+async def _llm_json(system_prompt: str, user_prompt: str, timeout: float = LLM_TIMEOUT_SECONDS) -> dict[str, Any]:
+    """Call the LLM and parse the first JSON object in its reply. Raises on failure/timeout."""
+    response = await asyncio.wait_for(
+        llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]),
+        timeout=timeout,
+    )
+    text = str(response.content)
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError("The model did not return a JSON object.")
+    return json.loads(text[start : end + 1])
 
-# =========================
-# State - original fields kept, new control fields added
-# =========================
+
+async def _llm_text(system_prompt: str, user_prompt: str, timeout: float = LLM_TIMEOUT_SECONDS) -> str:
+    response = await asyncio.wait_for(
+        llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]),
+        timeout=timeout,
+    )
+    return str(response.content)
+
+
+# =============================================================================
+# 2. IATA lookup (Req #3) — real, offline, deterministic. No LLM guessing.
+# =============================================================================
+
+def resolve_iata(city_or_airport: str) -> str | None:
+    """Resolve a city/airport name to an IATA code using the airportsdata package
+    (already a project dependency). Returns None rather than guessing if no
+    confident match is found — callers must handle that explicitly."""
+    if not city_or_airport:
+        return None
+
+    query = city_or_airport.strip().upper()
+    if len(query) == 3 and query in _IATA_AIRPORTS:
+        return query
+
+    query_lower = city_or_airport.strip().lower()
+    matches = [
+        code
+        for code, info in _IATA_AIRPORTS.items()
+        if info.get("city", "").lower() == query_lower
+    ]
+    if not matches:
+        matches = [
+            code
+            for code, info in _IATA_AIRPORTS.items()
+            if query_lower in info.get("city", "").lower() or query_lower in info.get("name", "").lower()
+        ]
+    return matches[0] if matches else None
+
+
+# =============================================================================
+# 3. State (Req #8) — trip_constraints extended, single source of truth
+# =============================================================================
+
+class TripConstraints(TypedDict, total=False):
+    origin: str
+    destination: str
+    departure_date: str
+    return_date: str
+    travelers: int
+    cabin_class: str
+    flight_preference: str
+    nonstop: bool
+    budget: str
+    hotel_budget: str
+    hotel_preference: str
+    amenities: list[str]
+    travel_style: str
+    special_preferences: list[str]
+
+
 class TravelState(TypedDict, total=False):
     messages: Annotated[list[AnyMessage], operator.add]
     user_query: str
 
-    # Supervisor + guardrail state
     guardrail_allowed: bool
     guardrail_reason: str
     selected_agents: list[str]
-    trip_constraints: dict[str, Any]
+    trip_constraints: TripConstraints
     supervisor_reasoning: str
 
-    # Original specialist results
     flight_results: str
+    flight_matches: list[dict[str, Any]]
+    flight_ranking: dict[str, Any]
+    flight_booking_links: dict[str, Any]
+    flight_limitations: str
+
     hotel_results: str
+    hotel_candidates: list[dict[str, Any]]
+    hotel_ranking: dict[str, Any]
+    hotel_booking_links: dict[str, Any]
+
     weather_results: str
+    budget_results: str
     itinerary: str
 
-    # New budget + HITL state
-    budget_results: str
     approval_request: str
     approved: bool
     human_feedback: str
     final_response: str
 
     llm_calls: int
+    agent_errors: dict[str, str]
 
 
-# =========================
-# Shared helpers
-# =========================
-KNOWN_AGENTS = {
-    "flight_agent",
-    "hotel_agent",
-    "weather_agent",
-    "budget_agent",
-    "itinerary_agent",
-}
-
-AGENT_ORDER = [
-    "flight_agent",
-    "hotel_agent",
-    "weather_agent",
-    "budget_agent",
-    "itinerary_agent",
-]
+KNOWN_AGENTS = {"flight_agent", "hotel_agent", "weather_agent", "budget_agent", "itinerary_agent"}
+AGENT_ORDER = ["flight_agent", "hotel_agent", "weather_agent", "budget_agent", "itinerary_agent"]
 
 
-def _llm_text(system_prompt: str, user_prompt: str) -> str:
-    response = llm.invoke(
-        [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt),
-        ]
-    )
-    return str(response.content)
-
-
-def _json_from_llm(text: str) -> dict[str, Any]:
-    """Extract the first complete JSON object returned by the model."""
-    start = text.find("{")
-    end = text.rfind("}")
-
-    if start == -1 or end == -1 or end < start:
-        raise ValueError("The model did not return a JSON object.")
-
-    return json.loads(text[start : end + 1])
-
-
-def _empty_constraints() -> dict[str, Any]:
+def _empty_constraints() -> TripConstraints:
     return {
-        "destination": "",
         "origin": "",
-        "duration": "",
+        "destination": "",
+        "departure_date": "",
+        "return_date": "",
+        "travelers": 1,
+        "cabin_class": "",
+        "flight_preference": "",
+        "nonstop": False,
         "budget": "",
+        "hotel_budget": "",
+        "hotel_preference": "",
+        "amenities": [],
         "travel_style": "",
         "special_preferences": [],
     }
 
 
-# =========================
-# Supervisor Agent + Input Guardrail
-# =========================
-def supervisor_agent(state: TravelState):
-    query = state["user_query"]
-    llm_calls = state.get("llm_calls", 0)
+# =============================================================================
+# 4. Supervisor + guardrail — MERGED INTO ONE LLM CALL (Req #9)
+# =============================================================================
+# The old code did two separate LLM calls here (guardrail, then supervisor).
+# They're independent asks of the same model over the same input, so they're
+# combined into a single structured call. This is the one place I removed an
+# LLM call outright rather than just parallelizing, because there's nothing
+# to run concurrently — it's the same input evaluated twice.
 
-    guardrail_prompt = f"""
-Determine whether the following request belongs to travel planning or travel
-information. Valid requests can include destinations, flights, hotels, weather,
-budgets, visas, transportation, sightseeing, food, packing, or itineraries.
+SUPERVISOR_PROMPT = """
+You are the routing brain for a multi-agent travel-planning system. Do two
+things with the user's request below, and return ONLY strict JSON:
 
-Block clearly unrelated requests and requests asking for harmful or illegal
-instructions. Do not block a valid travel request merely because some details
-are missing.
+1. GUARDRAIL: decide if this is a legitimate travel-planning/travel-info
+   request (destinations, flights, hotels, weather, budget, visas,
+   itineraries, transport, food, packing, etc). Block only requests that are
+   clearly unrelated to travel or that ask for harmful/illegal instructions.
+   Do not block a valid travel request just because some details are missing.
 
-Return strict JSON only:
+2. If allowed, extract trip constraints and pick which specialist agents are
+   needed:
+   - flight_agent: needed if flights/airports/routes are relevant
+   - hotel_agent: needed if accommodation is relevant
+   - weather_agent: needed if weather/climate/packing is relevant
+   - budget_agent: needed if cost/affordability is relevant
+   - itinerary_agent: ALWAYS include
+
+Return strict JSON only, no prose, using exactly this schema:
 {{
   "allowed": true,
-  "reason": ""
-}}
-
-User request:
-{query}
-"""
-
-    # Fail open on parser/model errors so a temporary JSON-format issue does not
-    # break the original travel-planning behavior.
-    try:
-        guardrail_raw = _llm_text(
-            "You are the input guardrail for a travel-planning application. "
-            "Return strict JSON only.",
-            guardrail_prompt,
-        )
-        guardrail_result = _json_from_llm(guardrail_raw)
-        allowed = bool(guardrail_result.get("allowed", True))
-        guardrail_reason = str(guardrail_result.get("reason", "")).strip()
-        llm_calls += 1
-    except Exception as exc:
-        print(f"Guardrail fallback used: {exc}")
-        allowed = True
-        guardrail_reason = "Guardrail validation fallback allowed the request."
-
-    if not allowed:
-        reason = guardrail_reason or (
-            "TripMate AI can only help with travel-planning requests. "
-            "Please ask about a destination, flight, hotel, weather, budget, "
-            "or itinerary."
-        )
-        return {
-            "guardrail_allowed": False,
-            "guardrail_reason": reason,
-            "selected_agents": [],
-            "trip_constraints": _empty_constraints(),
-            "supervisor_reasoning": reason,
-            "final_response": reason,
-            "messages": [AIMessage(content=f"Guardrail blocked request: {reason}")],
-            "llm_calls": llm_calls,
-        }
-
-    supervisor_prompt = f"""
-You are the supervisor of a multi-agent travel-planning system.
-Choose only the specialist agents needed for the request.
-
-Available agents:
-- flight_agent: flights, airports, airlines, routes, airfare, or booking advice
-- hotel_agent: hotels, accommodation, neighborhoods, or places to stay
-- weather_agent: weather, climate, season, forecast, or packing advice
-- budget_agent: cost, affordability, price limits, or budget feasibility
-- itinerary_agent: creates the integrated travel plan and must always be included
-
-Return strict JSON only using this schema:
-{{
+  "reason": "",
   "selected_agents": ["flight_agent", "hotel_agent", "weather_agent", "budget_agent", "itinerary_agent"],
   "trip_constraints": {{
-    "destination": "",
     "origin": "",
-    "duration": "",
+    "destination": "",
+    "departure_date": "",
+    "return_date": "",
+    "travelers": 1,
+    "cabin_class": "",
+    "flight_preference": "",
+    "nonstop": false,
     "budget": "",
+    "hotel_budget": "",
+    "hotel_preference": "",
+    "amenities": [],
     "travel_style": "",
     "special_preferences": []
   }},
   "reasoning": ""
 }}
 
+Dates should be normalized to YYYY-MM-DD when the user gives enough
+information to do so; otherwise leave the field as an empty string — never
+invent a date.
+
 User request:
 {query}
 """
 
+
+async def supervisor_agent(state: TravelState) -> dict[str, Any]:
+    query = state["user_query"]
+    llm_calls = state.get("llm_calls", 0)
+
     try:
-        supervisor_raw = _llm_text(
-            "You route work to travel specialist agents. Return strict JSON only.",
-            supervisor_prompt,
+        parsed = await _llm_json(
+            "You are the routing and guardrail layer for a travel-planning app. "
+            "Return strict JSON only.",
+            SUPERVISOR_PROMPT.format(query=query),
         )
-        parsed = _json_from_llm(supervisor_raw)
-        requested_agents = parsed.get("selected_agents", [])
-        selected_agents = [
-            name for name in AGENT_ORDER
-            if name in requested_agents and name in KNOWN_AGENTS
-        ]
-
-        # The itinerary agent integrates whichever specialist results were selected.
-        if "itinerary_agent" not in selected_agents:
-            selected_agents.append("itinerary_agent")
-
-        constraints = _empty_constraints()
-        parsed_constraints = parsed.get("trip_constraints", {})
-        if isinstance(parsed_constraints, dict):
-            constraints.update(parsed_constraints)
-
-        reasoning = str(parsed.get("reasoning", "")).strip()
         llm_calls += 1
     except Exception as exc:
         print(f"Supervisor fallback used: {exc}")
-        # Original workflow behavior is preserved as the fallback.
-        selected_agents = AGENT_ORDER.copy()
+        # Fail open, same philosophy as the original: don't let a parsing
+        # hiccup block a legitimate request.
         constraints = _empty_constraints()
-        reasoning = (
-            "Supervisor parsing failed, so the original full travel workflow "
-            "was selected as a safe fallback."
+        return {
+            "guardrail_allowed": True,
+            "guardrail_reason": "",
+            "selected_agents": AGENT_ORDER.copy(),
+            "trip_constraints": constraints,
+            "supervisor_reasoning": (
+                "Supervisor parsing failed; the full agent set was selected as a "
+                "safe fallback."
+            ),
+            "messages": [AIMessage(content="Supervisor fallback engaged.")],
+            "llm_calls": llm_calls,
+        }
+
+    allowed = bool(parsed.get("allowed", True))
+    reason = str(parsed.get("reason", "")).strip()
+
+    if not allowed:
+        final_reason = reason or (
+            "TripMate AI can only help with travel-planning requests. "
+            "Please ask about a destination, flight, hotel, weather, budget, "
+            "or itinerary."
         )
+        return {
+            "guardrail_allowed": False,
+            "guardrail_reason": final_reason,
+            "selected_agents": [],
+            "trip_constraints": _empty_constraints(),
+            "supervisor_reasoning": final_reason,
+            "final_response": final_reason,
+            "messages": [AIMessage(content=f"Guardrail blocked request: {final_reason}")],
+            "llm_calls": llm_calls,
+        }
+
+    requested_agents = parsed.get("selected_agents", [])
+    selected_agents = [a for a in AGENT_ORDER if a in requested_agents and a in KNOWN_AGENTS]
+    if "itinerary_agent" not in selected_agents:
+        selected_agents.append("itinerary_agent")
+
+    constraints = _empty_constraints()
+    raw_constraints = parsed.get("trip_constraints", {})
+    if isinstance(raw_constraints, dict):
+        constraints.update(raw_constraints)
 
     return {
         "guardrail_allowed": True,
-        "guardrail_reason": guardrail_reason,
+        "guardrail_reason": reason,
         "selected_agents": selected_agents,
         "trip_constraints": constraints,
-        "supervisor_reasoning": reasoning,
+        "supervisor_reasoning": str(parsed.get("reasoning", "")).strip(),
         "messages": [AIMessage(content="Supervisor created the agent plan.")],
         "llm_calls": llm_calls,
     }
 
 
-# =========================
-# Guardrail blocked response
-# =========================
-def guardrail_blocked_agent(state: TravelState):
+def guardrail_blocked_agent(state: TravelState) -> dict[str, Any]:
     reason = state.get("final_response") or state.get("guardrail_reason") or (
         "This request was blocked by the travel input guardrail."
     )
-    return {
-        "final_response": reason,
-        "messages": [AIMessage(content=reason)],
-    }
+    return {"final_response": reason, "messages": [AIMessage(content=reason)]}
 
 
-# =========================
-# Flight Agent - original behavior kept
-# =========================
-FLIGHT_AGENT_PROMPT = """
-You are a travel flight expert.
+# =============================================================================
+# 5. Flight agent — REAL route-specific search (Req #3, #4, #5)
+# =============================================================================
 
-User Query:
-{query}
-
-Airport Information:
-{airport_data}
-
-Airline Information:
-{airline_data}
-
-Generate:
-1. Likely departure airport
-2. Likely arrival airport
-3. Airlines serving this route
-4. Typical flight duration
-5. Estimated airfare range
-6. Peak season pricing warning
-7. Booking advice
-
-Return concise travel guidance.
-"""
-
-
-def flight_agent(state: TravelState):
-    print("\nINSIDE FLIGHT AGENT\n")
-    query = state["user_query"]
-
-    try:
-        airports = asyncio.run(aviation_mcp_call("list_airports"))
-        airlines = asyncio.run(aviation_mcp_call("list_airlines"))
-
-        print("\nAIRPORTS:", airports)
-        print("\nAIRLINES:", airlines)
-
-        prompt = FLIGHT_AGENT_PROMPT.format(
-            query=query,
-            airport_data=str(airports)[:3000],
-            airline_data=str(airlines)[:3000],
-        )
-
-        response = llm.invoke(
-            [
-                SystemMessage(content="You are an expert travel flight planner."),
-                HumanMessage(content=prompt),
-            ]
-        )
-        flight_data = response.content
-    except Exception as exc:
-        print(
-            f"FLIGHT AGENT MCP ERROR: "
-            f"{type(exc).__name__}: {exc}",
-            flush=True,
-        )
-        flight_data = f"Flight information unavailable: {exc}"
-
-    return {
-        "flight_results": flight_data,
-        "messages": [AIMessage(content="Flight recommendations generated")],
-        "llm_calls": state.get("llm_calls", 0) + 1,
-    }
-
-
-# =========================
-# Hotel Agent - original behavior kept
-# =========================
-def hotel_agent(state: TravelState):
-    query = (
-        f"Best hotels for "
-        f"{state['user_query']}"
+async def _discover_aviation_tools() -> dict[str, Any]:
+    """Ask the actual connected MCP server what it has, instead of assuming
+    tool names. Returns {tool_name: tool_object} for whatever is available."""
+    tools = await asyncio.wait_for(
+        mcp_client.get_tools(server_name="aviationstack"), timeout=MCP_TIMEOUT_SECONDS
     )
+    return {t.name: t for t in tools}
+
+
+def _rank_flight_matches(matches: list[dict[str, Any]], constraints: TripConstraints) -> dict[str, Any]:
+    """Pure-Python ranking over REAL retrieved records. No price data exists
+    in this integration, so there is deliberately no 'cheapest' category —
+    see flight_limitations in the output instead of a fabricated one."""
+    if not matches:
+        return {"note": "No matching flight records were returned for this route."}
+
+    preferred_airline = (constraints.get("flight_preference") or "").strip().lower()
+
+    def has_time(m: dict[str, Any]) -> bool:
+        return bool(m.get("departure_time") and m.get("arrival_time"))
+
+    def duration_minutes(m: dict[str, Any]) -> float | None:
+        try:
+            dep = datetime.fromisoformat(m["departure_time"])
+            arr = datetime.fromisoformat(m["arrival_time"])
+            return (arr - dep).total_seconds() / 60.0
+        except Exception:
+            return None
+
+    ranking: dict[str, Any] = {}
+
+    airline_matched = [
+        m for m in matches
+        if preferred_airline and preferred_airline in (m.get("airline") or "").lower()
+    ]
+    if airline_matched:
+        ranking["matches_airline_preference"] = airline_matched[:3]
+
+    timed = [m for m in matches if has_time(m)]
+    timed_with_duration = [(m, duration_minutes(m)) for m in timed]
+    timed_with_duration = [(m, d) for m, d in timed_with_duration if d is not None]
+    if timed_with_duration:
+        timed_with_duration.sort(key=lambda pair: pair[1])
+        ranking["shortest_scheduled_duration"] = [
+            {**m, "scheduled_duration_minutes": round(d)} for m, d in timed_with_duration[:3]
+        ]
+
+    ranking["all_matches"] = matches[:10]
+    ranking["total_matches_found"] = len(matches)
+    return ranking
+
+
+async def flight_agent(state: TravelState) -> dict[str, Any]:
+    constraints = state.get("trip_constraints", {}) or {}
+    origin_name = constraints.get("origin") or ""
+    destination_name = constraints.get("destination") or ""
+    departure_date = constraints.get("departure_date") or ""
+
+    origin_iata = resolve_iata(origin_name)
+    destination_iata = resolve_iata(destination_name)
+
+    if not origin_iata or not destination_iata:
+        missing = []
+        if not origin_iata:
+            missing.append(f"origin ('{origin_name or 'not provided'}')")
+        if not destination_iata:
+            missing.append(f"destination ('{destination_name or 'not provided'}')")
+        message = (
+            "Couldn't resolve an IATA airport code for: " + ", ".join(missing) + ". "
+            "Ask the user for a specific city or airport name and try again."
+        )
+        return {
+            "flight_results": message,
+            "flight_matches": [],
+            "flight_ranking": {},
+            "flight_booking_links": {},
+            "flight_limitations": message,
+            "messages": [AIMessage(content="Flight agent could not resolve airport codes.")],
+        }
+
+    matches: list[dict[str, Any]] = []
+    tools_found: list[str] = []
+    tools_missing: list[str] = []
+    error_note = ""
 
     try:
-        hotel_results = asyncio.run(
-            tavily_mcp_search(query)
-        )
+        available_tools = await _discover_aviation_tools()
 
-    except Exception as exc:
-        print(
-            f"HOTEL AGENT MCP ERROR: "
-            f"{type(exc).__name__}: {exc}",
-            flush=True,
-        )
-
-        hotel_results = (
-            "Live hotel search is temporarily unavailable. "
-            "Provide general accommodation and neighborhood "
-            "guidance based on the destination and clearly "
-            "label it as non-live advice."
-        )
-
-    return {
-        "hotel_results": hotel_results,
-        "messages": [
-            AIMessage(
-                content="Hotel information processed."
+        if "list_routes" in available_tools:
+            tools_found.append("list_routes")
+            routes_result = await asyncio.wait_for(
+                available_tools["list_routes"].ainvoke(
+                    {"dep_iata": origin_iata, "arr_iata": destination_iata, "limit": 10}
+                ),
+                timeout=MCP_TIMEOUT_SECONDS,
             )
-        ],
-        "llm_calls": (
-            state.get("llm_calls", 0) + 1
-        ),
+            for record in _coerce_records(routes_result):
+                matches.append(
+                    {
+                        "source": "list_routes",
+                        "airline": record.get("airline_name") or record.get("airline") or "",
+                        "departure_airport": origin_iata,
+                        "arrival_airport": destination_iata,
+                        "flight_number": record.get("flight_number", ""),
+                        "departure_time": record.get("departure_time", ""),
+                        "arrival_time": record.get("arrival_time", ""),
+                    }
+                )
+        else:
+            tools_missing.append("list_routes")
+
+        if "historical_flights_by_date" in available_tools and departure_date:
+            tools_found.append("historical_flights_by_date")
+            hist_result = await asyncio.wait_for(
+                available_tools["historical_flights_by_date"].ainvoke(
+                    {
+                        "flight_date": departure_date,
+                        "number_of_flights": 10,
+                        "dep_iata": origin_iata,
+                        "arr_iata": destination_iata,
+                    }
+                ),
+                timeout=MCP_TIMEOUT_SECONDS,
+            )
+            for record in _coerce_records(hist_result):
+                matches.append(
+                    {
+                        "source": "historical_flights_by_date",
+                        "airline": record.get("airline_name") or record.get("airline") or "",
+                        "departure_airport": origin_iata,
+                        "arrival_airport": destination_iata,
+                        "flight_number": record.get("flight_number", ""),
+                        "departure_time": record.get("departure_scheduled") or record.get("departure_time", ""),
+                        "arrival_time": record.get("arrival_scheduled") or record.get("arrival_time", ""),
+                    }
+                )
+        elif "historical_flights_by_date" not in available_tools:
+            tools_missing.append("historical_flights_by_date")
+
+    except asyncio.TimeoutError:
+        error_note = "The aviation MCP server did not respond in time."
+    except Exception as exc:
+        error_note = f"Aviation MCP error: {type(exc).__name__}: {exc}"
+
+    limitation_parts = [
+        "AviationStack (via this MCP integration) does not provide fare pricing, "
+        "seat availability, or booking capability — only schedule/route reference "
+        "data. Any prices shown to the user must come from the booking link, not "
+        "from this agent."
+    ]
+    if tools_missing:
+        limitation_parts.append(
+            f"The following expected tools were not found on the connected server: "
+            f"{', '.join(tools_missing)}."
+        )
+    if error_note:
+        limitation_parts.append(error_note)
+    flight_limitations = " ".join(limitation_parts)
+
+    ranking = _rank_flight_matches(matches, constraints)
+    booking_links = _build_flight_booking_links(
+        origin_iata, destination_iata, origin_name, destination_name, departure_date
+    )
+
+    if matches:
+        summary = (
+            f"Found {len(matches)} route/schedule record(s) between {origin_iata} and "
+            f"{destination_iata} using: {', '.join(tools_found) or 'no live tools'}. "
+            f"{flight_limitations}"
+        )
+    else:
+        summary = (
+            f"No route/schedule records were returned for {origin_iata} -> {destination_iata}. "
+            f"{flight_limitations}"
+        )
+
+    return {
+        "flight_results": summary,
+        "flight_matches": matches,
+        "flight_ranking": ranking,
+        "flight_booking_links": booking_links,
+        "flight_limitations": flight_limitations,
+        "messages": [AIMessage(content="Flight route search completed.")],
     }
 
 
-# =========================
-# Weather Agent - original behavior kept
-# =========================
-def weather_agent(state: TravelState):
-    city = extract_destination(
-        state["user_query"]
-    )
+def _coerce_records(result: Any) -> list[dict[str, Any]]:
+    """MCP tool results can come back as a list, a dict with a 'data' key, or
+    a JSON string depending on server version — normalize without inventing
+    fields that aren't there."""
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except Exception:
+            return []
+    if isinstance(result, dict):
+        result = result.get("data", result.get("results", []))
+    if isinstance(result, list):
+        return [r for r in result if isinstance(r, dict)]
+    return []
 
-    try:
-        weather_data = asyncio.run(
-            weather_mcp_search(city)
-        )
 
-        forecast_data = asyncio.run(
-            forecast_mcp_search(city)
-        )
+def _build_flight_booking_links(
+    origin_iata: str, destination_iata: str, origin_name: str, destination_name: str, departure_date: str
+) -> dict[str, Any]:
+    """Constructed from Google Flights' publicly documented natural-language
+    query parameter (`q=`). This is a SEARCH link, not a price quote —
+    labeled as such so the final response can't misrepresent it."""
+    query_bits = [f"Flights from {origin_name or origin_iata} to {destination_name or destination_iata}"]
+    if departure_date:
+        query_bits.append(f"on {departure_date}")
+    query = " ".join(query_bits)
+    url = "https://www.google.com/travel/flights?q=" + query.replace(" ", "%20")
+    return {
+        "type": "search_link",
+        "provider": "Google Flights",
+        "url": url,
+        "disclaimer": "This opens a live search — it does not guarantee the price or availability shown.",
+    }
 
-        weather_results = f"""
-Current Weather:
-{weather_data}
 
-Forecast:
-{forecast_data}
+# =============================================================================
+# 6. Hotel agent — real Tavily results, structured extraction only (Req #6, #7)
+# =============================================================================
+
+HOTEL_EXTRACTION_PROMPT = """
+Below is raw web search text about hotels. Extract ONLY hotels that are
+explicitly named in the text. Do not invent hotels, prices, or ratings.
+If a field isn't mentioned for a given hotel, use null for that field —
+never guess a plausible-sounding value.
+
+Return strict JSON only:
+{{
+  "hotels": [
+    {{"name": "", "price_mentioned": null, "rating_mentioned": null, "location_note": null, "notable_feature": null}}
+  ]
+}}
+
+Search text:
+{text}
 """
 
-    except Exception as exc:
-        print(
-            f"WEATHER AGENT MCP ERROR: "
-            f"{type(exc).__name__}: {exc}",
-            flush=True,
+
+def _rank_hotel_candidates(hotels: list[dict[str, Any]]) -> dict[str, Any]:
+    if not hotels:
+        return {"note": "No hotels were confidently extracted from the search results."}
+
+    ranking: dict[str, Any] = {"all_candidates": hotels}
+
+    def parse_price(h: dict[str, Any]) -> float | None:
+        raw = h.get("price_mentioned")
+        if not raw:
+            return None
+        digits = "".join(ch for ch in str(raw) if ch.isdigit() or ch == ".")
+        try:
+            return float(digits) if digits else None
+        except ValueError:
+            return None
+
+    def parse_rating(h: dict[str, Any]) -> float | None:
+        raw = h.get("rating_mentioned")
+        if not raw:
+            return None
+        digits = "".join(ch for ch in str(raw) if ch.isdigit() or ch == ".")
+        try:
+            return float(digits) if digits else None
+        except ValueError:
+            return None
+
+    priced = [(h, parse_price(h)) for h in hotels]
+    priced = [(h, p) for h, p in priced if p is not None]
+    if priced:
+        priced.sort(key=lambda pair: pair[1])
+        ranking["best_budget"] = priced[0][0]
+
+    rated = [(h, parse_rating(h)) for h in hotels]
+    rated = [(h, r) for h, r in rated if r is not None]
+    if rated:
+        rated.sort(key=lambda pair: pair[1], reverse=True)
+        ranking["best_rated"] = rated[0][0]
+
+    if not priced and not rated:
+        ranking["note"] = (
+            "The search results didn't include explicit prices or ratings for these "
+            "hotels — showing them unranked. Use the booking link for live pricing."
         )
 
+    return ranking
+
+
+def _build_hotel_booking_links(destination: str, checkin: str, checkout: str, travelers: int) -> dict[str, Any]:
+    """Booking.com's documented searchresults.html query structure — again,
+    a search link, not a confirmed price/availability."""
+    params = [f"ss={(destination or '').replace(' ', '+')}"]
+    if checkin:
+        params.append(f"checkin={checkin}")
+    if checkout:
+        params.append(f"checkout={checkout}")
+    params.append(f"group_adults={max(travelers or 1, 1)}")
+    url = "https://www.booking.com/searchresults.html?" + "&".join(params)
+    return {
+        "type": "search_link",
+        "provider": "Booking.com",
+        "url": url,
+        "disclaimer": "This opens a live search — it does not guarantee the price or availability shown.",
+    }
+
+
+async def hotel_agent(state: TravelState) -> dict[str, Any]:
+    constraints = state.get("trip_constraints", {}) or {}
+    destination = constraints.get("destination") or ""
+
+    query_parts = [f"best hotels in {destination}" if destination else state["user_query"]]
+    if constraints.get("hotel_budget"):
+        query_parts.append(f"under {constraints['hotel_budget']}")
+    if constraints.get("hotel_preference"):
+        query_parts.append(constraints["hotel_preference"])
+    if constraints.get("amenities"):
+        query_parts.append("with " + ", ".join(constraints["amenities"]))
+    search_query = " ".join(str(p) for p in query_parts if p)
+
+    hotel_candidates: list[dict[str, Any]] = []
+    llm_calls_used = 0
+
+    try:
+        raw_results = await asyncio.wait_for(tavily_mcp_search(search_query), timeout=MCP_TIMEOUT_SECONDS)
+        extraction = await _llm_json(
+            "You extract only explicitly-stated facts from search text. Return strict JSON only.",
+            HOTEL_EXTRACTION_PROMPT.format(text=str(raw_results)[:6000]),
+        )
+        llm_calls_used += 1
+        hotel_candidates = [h for h in extraction.get("hotels", []) if isinstance(h, dict) and h.get("name")]
+        hotel_results_text = f"Found {len(hotel_candidates)} hotel(s) mentioned in live search results for {destination}."
+    except asyncio.TimeoutError:
+        hotel_results_text = "Live hotel search timed out. No hotel data is available for this request."
+    except Exception as exc:
+        print(f"HOTEL AGENT ERROR: {type(exc).__name__}: {exc}", flush=True)
+        hotel_results_text = (
+            "Live hotel search is temporarily unavailable, and no hotel data could be "
+            "retrieved. General, non-live advice is not provided here to avoid implying "
+            "these are real options."
+        )
+
+    ranking = _rank_hotel_candidates(hotel_candidates)
+    booking_links = _build_hotel_booking_links(
+        destination, constraints.get("departure_date", ""), constraints.get("return_date", ""),
+        constraints.get("travelers", 1),
+    )
+
+    return {
+        "hotel_results": hotel_results_text,
+        "hotel_candidates": hotel_candidates,
+        "hotel_ranking": ranking,
+        "hotel_booking_links": booking_links,
+        "messages": [AIMessage(content="Hotel search processed.")],
+        "llm_calls": state.get("llm_calls", 0) + llm_calls_used,
+    }
+
+
+# =============================================================================
+# 7. Weather agent — NO extra LLM call (Req #8, #9): reuses trip_constraints
+# =============================================================================
+
+async def weather_agent(state: TravelState) -> dict[str, Any]:
+    constraints = state.get("trip_constraints", {}) or {}
+    city = constraints.get("destination") or ""
+
+    if not city:
+        message = "No destination was extracted from the request, so weather data was skipped."
+        return {"weather_results": message, "messages": [AIMessage(content=message)]}
+
+    try:
+        weather_data, forecast_data = await asyncio.wait_for(
+            asyncio.gather(weather_mcp_search(city), forecast_mcp_search(city)),
+            timeout=MCP_TIMEOUT_SECONDS,
+        )
+        weather_results = f"Current Weather:\n{weather_data}\n\nForecast:\n{forecast_data}"
+    except asyncio.TimeoutError:
+        weather_results = f"Live weather lookup for {city} timed out. Advise the traveler to check a live forecast before departure."
+    except Exception as exc:
+        print(f"WEATHER AGENT ERROR: {type(exc).__name__}: {exc}", flush=True)
         weather_results = (
-            f"Live weather information for {city} "
-            "is temporarily unavailable. Give general "
-            "seasonal guidance and advise the traveler "
-            "to verify the forecast before departure."
+            f"Live weather information for {city} is temporarily unavailable. "
+            "Advise the traveler to verify the forecast before departure."
         )
 
-    return {
-        "weather_results": weather_results,
-        "messages": [
-            AIMessage(
-                content="Weather information processed."
-            )
-        ],
-    }
+    return {"weather_results": weather_results, "messages": [AIMessage(content="Weather information processed.")]}
 
 
-# =========================
-# Budget Agent - new specialist
-# =========================
-def budget_agent(state: TravelState):
+# =============================================================================
+# 8. Parallel data-agent node (Req #9) — flight/hotel/weather run concurrently
+# =============================================================================
+# The original graph chained agents one at a time via routing edges, which
+# made true concurrency impossible without a bigger restructure. Flight,
+# hotel, and weather don't depend on each other's output (only budget and
+# itinerary do), so this node runs the selected ones together with
+# asyncio.gather and isolates failures per-agent (Req #10) instead of one
+# slow agent blocking the others or a failure taking down the whole request.
+
+async def data_agents_node(state: TravelState) -> dict[str, Any]:
+    selected = set(state.get("selected_agents", []))
+    tasks: dict[str, Any] = {}
+
+    if "flight_agent" in selected:
+        tasks["flight_agent"] = flight_agent(state)
+    if "hotel_agent" in selected:
+        tasks["hotel_agent"] = hotel_agent(state)
+    if "weather_agent" in selected:
+        tasks["weather_agent"] = weather_agent(state)
+
+    if not tasks:
+        return {}
+
+    results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+
+    merged: dict[str, Any] = {}
+    errors = dict(state.get("agent_errors", {}))
+    llm_calls = state.get("llm_calls", 0)
+    all_messages: list[AnyMessage] = []
+
+    for name, result in zip(tasks.keys(), results):
+        if isinstance(result, Exception):
+            print(f"{name} raised: {type(result).__name__}: {result}", flush=True)
+            errors[name] = f"{type(result).__name__}: {result}"
+            continue
+        for key, value in result.items():
+            if key == "messages":
+                all_messages.extend(value)
+            elif key == "llm_calls":
+                llm_calls = max(llm_calls, value)
+            else:
+                merged[key] = value
+
+    merged["messages"] = all_messages
+    merged["llm_calls"] = llm_calls
+    merged["agent_errors"] = errors
+    return merged
+
+
+# =============================================================================
+# 9. Budget agent — unchanged logic, now async, depends on data_agents_node
+# =============================================================================
+
+async def budget_agent(state: TravelState) -> dict[str, Any]:
     prompt = f"""
 Analyze whether this trip is realistic for the user's budget.
 
@@ -461,44 +827,43 @@ User Query:
 Trip Constraints:
 {state.get('trip_constraints', {})}
 
-Flight Results:
+Flight Info (schedule data only — no pricing available, see flight_limitations):
 {state.get('flight_results', '')}
 
-Hotel Results:
+Hotel Info:
 {state.get('hotel_results', '')}
 
-Weather Results:
+Weather Info:
 {state.get('weather_results', '')}
 
 Return:
-1. Estimated cost categories
+1. Estimated cost categories (label clearly as rough estimates, since no live
+   flight/hotel pricing is available from the connected tools)
 2. Budget risk areas
 3. Money-saving suggestions
 4. Overall feasibility
 
-If exact live prices are unavailable, clearly label estimates as approximate.
+Do not state or imply a specific flight or hotel price as fact.
 """
-
-    response = llm.invoke(
-        [
-            SystemMessage(content="You are a practical travel budget analyst."),
-            HumanMessage(content=prompt),
-        ]
-    )
+    try:
+        text = await _llm_text("You are a practical travel budget analyst.", prompt)
+    except asyncio.TimeoutError:
+        text = "Budget analysis timed out and was skipped for this run."
 
     return {
-        "budget_results": response.content,
+        "budget_results": text,
         "messages": [AIMessage(content="Budget assessment generated.")],
         "llm_calls": state.get("llm_calls", 0) + 1,
     }
 
 
-# =========================
-# Itinerary Agent - original behavior extended with selected results
-# =========================
-def itinerary_agent(state: TravelState):
+# =============================================================================
+# 10. Itinerary + HITL + final agent — same shape as before, now async
+# =============================================================================
+
+async def itinerary_agent(state: TravelState) -> dict[str, Any]:
     prompt = f"""
-Create a complete travel itinerary.
+Create a complete travel itinerary draft.
 
 User Query:
 {state['user_query']}
@@ -506,28 +871,24 @@ User Query:
 Trip Constraints:
 {state.get('trip_constraints', {})}
 
-Flight Results:
+Flight Info:
 {state.get('flight_results', '')}
+Flight limitations: {state.get('flight_limitations', '')}
 
-Hotel Results:
+Hotel Info:
 {state.get('hotel_results', '')}
 
-Weather Results:
+Weather Info:
 {state.get('weather_results', '')}
 
-Budget Results:
+Budget Info:
 {state.get('budget_results', '')}
 
-Make the itinerary practical, budget-aware, and easy to follow.
-Create a clear draft that is ready for human review.
+Make the itinerary practical and easy to follow. Do not state a flight or
+hotel price as confirmed fact — point the user to the booking links for
+live pricing. Create a clear draft ready for human review.
 """
-
-    response = llm.invoke(
-        [
-            SystemMessage(content="You are an expert travel planner."),
-            HumanMessage(content=prompt),
-        ]
-    )
+    text = await _llm_text("You are an expert travel planner.", prompt)
 
     approval_request = (
         "Please review the generated draft itinerary. Approve it to create the "
@@ -535,18 +896,15 @@ Create a clear draft that is ready for human review.
     )
 
     return {
-        "itinerary": response.content,
+        "itinerary": text,
         "approval_request": approval_request,
         "messages": [AIMessage(content="Draft itinerary created for human review.")],
         "llm_calls": state.get("llm_calls", 0) + 1,
     }
 
 
-# =========================
-# Human-in-the-Loop approval
-# =========================
-def human_approval_agent(state: TravelState):
-    # Do not wrap interrupt() in try/except. LangGraph uses it to pause execution.
+def human_approval_agent(state: TravelState) -> dict[str, Any]:
+    # interrupt() is not wrapped in try/except — LangGraph relies on it to pause.
     review = interrupt(
         {
             "question": "Do you approve this itinerary?",
@@ -554,16 +912,13 @@ def human_approval_agent(state: TravelState):
             "approval_request": state.get("approval_request", ""),
             "selected_agents": state.get("selected_agents", []),
             "supervisor_reasoning": state.get("supervisor_reasoning", ""),
-            "expected_response": {
-                "approved": True,
-                "feedback": "Optional revision feedback",
-            },
+            "flight_booking_links": state.get("flight_booking_links", {}),
+            "hotel_booking_links": state.get("hotel_booking_links", {}),
+            "expected_response": {"approved": True, "feedback": "Optional revision feedback"},
         }
     )
-
     approved = bool(review.get("approved", False))
     human_feedback = str(review.get("feedback", "")).strip()
-
     return {
         "approved": approved,
         "human_feedback": human_feedback,
@@ -571,19 +926,14 @@ def human_approval_agent(state: TravelState):
     }
 
 
-# =========================
-# Final Response Agent - original format kept, HITL feedback added
-# =========================
-def final_agent(state: TravelState):
+async def final_agent(state: TravelState) -> dict[str, Any]:
     if state.get("approved", False):
-        review_instruction = (
-            "The user approved the draft. Preserve its decisions while polishing it."
-        )
+        review_instruction = "The user approved the draft. Preserve its decisions while polishing it."
     else:
-        review_instruction = f"""
-The user requested a revision. Apply this feedback carefully:
-{state.get('human_feedback', '') or 'Improve the draft before finalizing it.'}
-"""
+        review_instruction = (
+            "The user requested a revision. Apply this feedback carefully:\n"
+            f"{state.get('human_feedback', '') or 'Improve the draft before finalizing it.'}"
+        )
 
     final_prompt = f"""
 Generate the final travel response for the user.
@@ -599,9 +949,12 @@ Supervisor Constraints:
 
 Flights:
 {state.get('flight_results', '')}
+Flight limitations: {state.get('flight_limitations', '')}
+Flight search link: {state.get('flight_booking_links', {})}
 
 Hotels:
 {state.get('hotel_results', '')}
+Hotel search link: {state.get('hotel_booking_links', {})}
 
 Weather:
 {state.get('weather_results', '')}
@@ -612,30 +965,25 @@ Budget Analysis:
 Draft Itinerary:
 {state.get('itinerary', '')}
 
-Format the final answer beautifully using these sections:
+Format the final answer using these sections:
 1. Trip Summary
-2. Flight Information
-3. Hotel Suggestions
+2. Flight Information (state clearly that live pricing isn't available and
+   link to the search link for booking)
+3. Hotel Suggestions (same — link to the search link)
 4. Weather Information
 5. Day-by-Day Itinerary
-6. Estimated Budget
+6. Estimated Budget (label as an estimate)
 7. Final Recommendations
 
-Important:
-- Be clear and practical.
-- Mention that live flight APIs may not provide ticket prices when pricing is unavailable.
-- Include weather-based travel advice.
-- Keep the response useful for real travel planning.
-- Incorporate the human feedback when revision was requested.
+Never state a flight/hotel price, rating, or availability as a confirmed
+fact unless it was explicitly present in the Flights/Hotels data above.
+Incorporate the human feedback when a revision was requested.
 """
-
-    response = llm.invoke(
-        [
-            SystemMessage(
-                content="You are a professional AI travel booking assistant."
-            ),
-            HumanMessage(content=final_prompt),
-        ]
+    response = await asyncio.wait_for(
+        llm.ainvoke(
+            [SystemMessage(content="You are a professional AI travel booking assistant."), HumanMessage(content=final_prompt)]
+        ),
+        timeout=LLM_TIMEOUT_SECONDS,
     )
 
     return {
@@ -645,142 +993,167 @@ Important:
     }
 
 
-# =========================
-# Dynamic Supervisor Routing
-# =========================
-ROUTE_MAP = {
-    "guardrail_blocked": "guardrail_blocked",
-    "flight_agent": "flight_agent",
-    "hotel_agent": "hotel_agent",
-    "weather_agent": "weather_agent",
-    "budget_agent": "budget_agent",
-    "itinerary_agent": "itinerary_agent",
-}
-
-
-def _selected_agents(state: TravelState) -> list[str]:
-    selected = state.get("selected_agents", [])
-    return [agent for agent in AGENT_ORDER if agent in selected]
-
+# =============================================================================
+# 11. Graph routing
+# =============================================================================
 
 def route_from_supervisor(state: TravelState) -> str:
-    if not state.get("guardrail_allowed", True):
-        return "guardrail_blocked"
-
-    selected = _selected_agents(state)
-    return selected[0] if selected else "itinerary_agent"
+    return "guardrail_blocked" if not state.get("guardrail_allowed", True) else "data_agents"
 
 
-def route_after_agent(current_agent: str):
-    def route(state: TravelState) -> str:
-        selected = _selected_agents(state)
-        current_index = AGENT_ORDER.index(current_agent)
-
-        for next_agent in AGENT_ORDER[current_index + 1 :]:
-            if next_agent in selected:
-                return next_agent
-
-        return "itinerary_agent"
-
-    return route
+def route_after_data_agents(state: TravelState) -> str:
+    selected = set(state.get("selected_agents", []))
+    return "budget_agent" if "budget_agent" in selected else "itinerary_agent"
 
 
-# =========================
-# Build Graph
-# =========================
-graph = StateGraph(TravelState)
+# =============================================================================
+# 12. Graph builder
+# =============================================================================
 
-graph.add_node("supervisor", supervisor_agent)
-graph.add_node("guardrail_blocked", guardrail_blocked_agent)
-graph.add_node("flight_agent", flight_agent)
-graph.add_node("hotel_agent", hotel_agent)
-graph.add_node("weather_agent", weather_agent)
-graph.add_node("budget_agent", budget_agent)
-graph.add_node("itinerary_agent", itinerary_agent)
-graph.add_node("human_approval", human_approval_agent)
-graph.add_node("final_agent", final_agent)
+def build_travel_graph(checkpointer: AsyncPostgresSaver):
+    graph = StateGraph(TravelState)
 
-graph.add_edge(START, "supervisor")
-graph.add_conditional_edges("supervisor", route_from_supervisor, ROUTE_MAP)
+    graph.add_node("supervisor", supervisor_agent)
+    graph.add_node("guardrail_blocked", guardrail_blocked_agent)
+    graph.add_node("data_agents", data_agents_node)
+    graph.add_node("budget_agent", budget_agent)
+    graph.add_node("itinerary_agent", itinerary_agent)
+    graph.add_node("human_approval", human_approval_agent)
+    graph.add_node("final_agent", final_agent)
 
-graph.add_conditional_edges(
-    "flight_agent", route_after_agent("flight_agent"), ROUTE_MAP
-)
-graph.add_conditional_edges(
-    "hotel_agent", route_after_agent("hotel_agent"), ROUTE_MAP
-)
-graph.add_conditional_edges(
-    "weather_agent", route_after_agent("weather_agent"), ROUTE_MAP
-)
-graph.add_conditional_edges(
-    "budget_agent", route_after_agent("budget_agent"), ROUTE_MAP
-)
+    graph.add_edge(START, "supervisor")
+    graph.add_conditional_edges(
+        "supervisor", route_from_supervisor, {"guardrail_blocked": "guardrail_blocked", "data_agents": "data_agents"}
+    )
+    graph.add_conditional_edges(
+        "data_agents", route_after_data_agents, {"budget_agent": "budget_agent", "itinerary_agent": "itinerary_agent"}
+    )
+    graph.add_edge("budget_agent", "itinerary_agent")
+    graph.add_edge("itinerary_agent", "human_approval")
+    graph.add_edge("human_approval", "final_agent")
+    graph.add_edge("final_agent", END)
+    graph.add_edge("guardrail_blocked", END)
 
-graph.add_edge("itinerary_agent", "human_approval")
-graph.add_edge("human_approval", "final_agent")
-graph.add_edge("final_agent", END)
-graph.add_edge("guardrail_blocked", END)
-
-# =========================
-# PostgreSQL Checkpointer - original persistence kept
-# =========================
-DATABASE_URL = get_database_url()
-_conn = psycopg.connect(
-    DATABASE_URL,
-    autocommit=True,
-    row_factory=dict_row,
-)
-checkpointer = PostgresSaver(_conn)
-checkpointer.setup()
-
-travel_graph = graph.compile(checkpointer=checkpointer)
+    return graph.compile(checkpointer=checkpointer)
 
 
-# =========================
-# FastAPI-facing helpers
-# =========================
+# =============================================================================
+# 13. Lifespan-managed backend (Req #1) — real pool, no global connection
+# =============================================================================
+
+class TravelBackend:
+    """Owns the connection pool, checkpointer, and compiled graph. One
+    instance per process, created/closed from FastAPI's lifespan so the pool
+    is opened and closed cleanly instead of leaking a bare global connection."""
+
+    def __init__(self) -> None:
+        self.pool: AsyncConnectionPool | None = None
+        self.checkpointer: AsyncPostgresSaver | None = None
+        self.graph = None
+
+    async def init(self, min_size: int = 2, max_size: int = 10) -> None:
+        database_url = get_database_url()
+        self.pool = AsyncConnectionPool(
+            conninfo=database_url,
+            min_size=min_size,
+            max_size=max_size,
+            kwargs={"autocommit": True, "row_factory": dict_row},
+            open=False,
+        )
+        await self.pool.open(wait=True, timeout=30)
+
+        self.checkpointer = AsyncPostgresSaver(self.pool)
+        await self.checkpointer.setup()
+
+        self.graph = build_travel_graph(self.checkpointer)
+
+    async def close(self) -> None:
+        if self.pool is not None:
+            await self.pool.close()
+
+    async def run_travel_agent(self, user_input: str, thread_id: str | None = None) -> dict[str, Any]:
+        if not thread_id:
+            thread_id = f"user_{uuid.uuid4().hex}"
+        config = {"configurable": {"thread_id": thread_id}}
+
+        result = await self.graph.ainvoke(
+            {
+                "messages": [HumanMessage(content=user_input)],
+                "user_query": user_input,
+                "guardrail_allowed": True,
+                "guardrail_reason": "",
+                "selected_agents": [],
+                "trip_constraints": _empty_constraints(),
+                "supervisor_reasoning": "",
+                "flight_results": "",
+                "flight_matches": [],
+                "flight_ranking": {},
+                "flight_booking_links": {},
+                "flight_limitations": "",
+                "hotel_results": "",
+                "hotel_candidates": [],
+                "hotel_ranking": {},
+                "hotel_booking_links": {},
+                "weather_results": "",
+                "budget_results": "",
+                "itinerary": "",
+                "approval_request": "",
+                "approved": False,
+                "human_feedback": "",
+                "final_response": "",
+                "llm_calls": 0,
+                "agent_errors": {},
+            },
+            config=config,
+        )
+        return _serialize_result(result, thread_id)
+
+    async def resume_travel_agent(self, thread_id: str, approved: bool, feedback: str = "") -> dict[str, Any]:
+        if not thread_id:
+            raise ValueError("thread_id is required to resume a travel plan.")
+        config = {"configurable": {"thread_id": thread_id}}
+        result = await self.graph.ainvoke(
+            Command(resume={"approved": approved, "feedback": feedback.strip()}),
+            config=config,
+        )
+        return _serialize_result(result, thread_id)
+
+
 def _interrupt_payload(result: dict[str, Any]) -> dict[str, Any] | None:
     interrupts = result.get("__interrupt__", [])
     if not interrupts:
         return None
-
     first_interrupt = interrupts[0]
     payload = getattr(first_interrupt, "value", first_interrupt)
     return payload if isinstance(payload, dict) else {"value": payload}
 
 
-def _serialize_result(
-    result: dict[str, Any],
-    thread_id: str,
-) -> dict[str, Any]:
+def _serialize_result(result: dict[str, Any], thread_id: str) -> dict[str, Any]:
     messages = result.get("messages", [])
     last_message = messages[-1].content if messages else ""
     answer = result.get("final_response") or last_message
     interrupt_payload = _interrupt_payload(result)
 
     if interrupt_payload:
-        answer = interrupt_payload.get("draft_itinerary") or result.get(
-            "itinerary", ""
-        )
+        answer = interrupt_payload.get("draft_itinerary") or result.get("itinerary", "")
 
     return {
         "thread_id": thread_id,
         "answer": answer,
         "requires_approval": interrupt_payload is not None,
         "approval_request": (
-            interrupt_payload.get("approval_request", "")
-            if interrupt_payload
-            else result.get("approval_request", "")
+            interrupt_payload.get("approval_request", "") if interrupt_payload else result.get("approval_request", "")
         ),
         "flight_results": result.get("flight_results", ""),
+        "flight_ranking": result.get("flight_ranking", {}),
+        "flight_booking_links": result.get("flight_booking_links", {}),
+        "flight_limitations": result.get("flight_limitations", ""),
         "hotel_results": result.get("hotel_results", ""),
+        "hotel_ranking": result.get("hotel_ranking", {}),
+        "hotel_booking_links": result.get("hotel_booking_links", {}),
         "weather_results": result.get("weather_results", ""),
         "budget_results": result.get("budget_results", ""),
-        "itinerary": (
-            interrupt_payload.get("draft_itinerary", "")
-            if interrupt_payload
-            else result.get("itinerary", "")
-        ),
+        "itinerary": interrupt_payload.get("draft_itinerary", "") if interrupt_payload else result.get("itinerary", ""),
         "selected_agents": result.get("selected_agents", []),
         "trip_constraints": result.get("trip_constraints", {}),
         "supervisor_reasoning": result.get("supervisor_reasoning", ""),
@@ -788,61 +1161,82 @@ def _serialize_result(
         "guardrail_reason": result.get("guardrail_reason", ""),
         "approved": result.get("approved"),
         "human_feedback": result.get("human_feedback", ""),
+        "agent_errors": result.get("agent_errors", {}),
         "llm_calls": result.get("llm_calls", 0),
     }
 
 
-def run_travel_agent(user_input: str, thread_id: str | None = None):
-    """Start a new travel-planning run and pause at human approval."""
-    if not thread_id:
-        thread_id = f"user_{uuid.uuid4().hex}"
+# =============================================================================
+# 14. Module-level singleton + FastAPI lifespan wiring
+# =============================================================================
+# app.py currently does `from backend import run_travel_agent, resume_travel_agent`
+# and calls them as plain sync functions. To use this file, app.py needs a
+# small update — see the notes at the very bottom of this file. It's a few
+# lines, not a rewrite, and I've left it out of this file on purpose since
+# you asked specifically for the backend file.
 
-    config = {"configurable": {"thread_id": thread_id}}
-
-    result = travel_graph.invoke(
-        {
-            "messages": [HumanMessage(content=user_input)],
-            "user_query": user_input,
-            "guardrail_allowed": True,
-            "guardrail_reason": "",
-            "selected_agents": [],
-            "trip_constraints": _empty_constraints(),
-            "supervisor_reasoning": "",
-            "flight_results": "",
-            "hotel_results": "",
-            "weather_results": "",
-            "budget_results": "",
-            "itinerary": "",
-            "approval_request": "",
-            "approved": False,
-            "human_feedback": "",
-            "final_response": "",
-            "llm_calls": 0,
-        },
-        config=config,
-    )
-
-    return _serialize_result(result, thread_id)
+_backend: TravelBackend | None = None
 
 
-def resume_travel_agent(
-    thread_id: str,
-    approved: bool,
-    feedback: str = "",
-):
-    """Resume the paused LangGraph thread after human review."""
-    if not thread_id:
-        raise ValueError("thread_id is required to resume a travel plan.")
+async def init_travel_backend() -> TravelBackend:
+    global _backend
+    if _backend is None:
+        _backend = TravelBackend()
+        await _backend.init()
+    return _backend
 
-    config = {"configurable": {"thread_id": thread_id}}
-    result = travel_graph.invoke(
-        Command(
-            resume={
-                "approved": approved,
-                "feedback": feedback.strip(),
-            }
-        ),
-        config=config,
-    )
 
-    return _serialize_result(result, thread_id)
+async def close_travel_backend() -> None:
+    global _backend
+    if _backend is not None:
+        await _backend.close()
+        _backend = None
+
+
+def get_travel_backend() -> TravelBackend:
+    if _backend is None:
+        raise RuntimeError(
+            "Travel backend is not initialized. Call `await init_travel_backend()` "
+            "during FastAPI startup (lifespan) before handling requests."
+        )
+    return _backend
+
+
+async def run_travel_agent(user_input: str, thread_id: str | None = None) -> dict[str, Any]:
+    """Async drop-in replacement for the old sync `run_travel_agent`."""
+    return await get_travel_backend().run_travel_agent(user_input, thread_id)
+
+
+async def resume_travel_agent(thread_id: str, approved: bool, feedback: str = "") -> dict[str, Any]:
+    """Async drop-in replacement for the old sync `resume_travel_agent`."""
+    return await get_travel_backend().resume_travel_agent(thread_id, approved, feedback)
+
+
+# =============================================================================
+# app.py CHANGES NEEDED TO USE THIS FILE (not applied here — you asked for
+# backend only). Three small changes:
+#
+# 1. Add a lifespan handler:
+#
+#    from contextlib import asynccontextmanager
+#    from backend_v2 import init_travel_backend, close_travel_backend
+#
+#    @asynccontextmanager
+#    async def lifespan(app: FastAPI):
+#        await init_travel_backend()
+#        yield
+#        await close_travel_backend()
+#
+#    app = FastAPI(..., lifespan=lifespan)
+#
+# 2. Change the import:
+#    from backend_v2 import run_travel_agent, resume_travel_agent
+#
+# 3. Await the calls (they're already inside `async def` routes, so this is
+#    just adding `await`):
+#    result = await run_travel_agent(user_input=user_message, thread_id=request_data.thread_id)
+#    result = await resume_travel_agent(thread_id=..., approved=..., feedback=...)
+#
+# Also drop `import nest_asyncio` / `nest_asyncio.apply()` from app.py — it's
+# no longer needed since nothing calls asyncio.run() inside a running loop.
+# =============================================================================
