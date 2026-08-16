@@ -16,6 +16,7 @@ load_dotenv()
 os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
 
+from psycopg import OperationalError as PsycopgOperationalError
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 from langgraph.graph import StateGraph, START, END
@@ -40,6 +41,11 @@ except Exception:
 
 LLM_TIMEOUT_SECONDS = 25
 MCP_TIMEOUT_SECONDS = 15
+# The weather MCP server runs on a separate free-tier Render service, which
+# spins down after ~15 min idle and can take 30-60s to cold-start on the
+# next request. The shared 15s MCP_TIMEOUT_SECONDS isn't enough for that --
+# give weather its own longer budget instead of tightening the others.
+WEATHER_TIMEOUT_SECONDS = 50
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
@@ -56,6 +62,12 @@ def get_database_url() -> str:
     if "sslmode=" not in database_url:
         separator = "&" if "?" in database_url else "?"
         database_url = f"{database_url}{separator}sslmode=require"
+    if "keepalives=" not in database_url:
+        separator = "&" if "?" in database_url else "?"
+        database_url = (
+            f"{database_url}{separator}"
+            "keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=3"
+        )
     return database_url
 
 
@@ -661,7 +673,7 @@ async def weather_agent(state: TravelState) -> dict[str, Any]:
     try:
         weather_data, forecast_data = await asyncio.wait_for(
             asyncio.gather(weather_mcp_search(city), forecast_mcp_search(city)),
-            timeout=MCP_TIMEOUT_SECONDS,
+            timeout=WEATHER_TIMEOUT_SECONDS,
         )
         weather_results = f"Current Weather:\n{weather_data}\n\nForecast:\n{forecast_data}"
     except asyncio.TimeoutError:
@@ -936,6 +948,8 @@ class TravelBackend:
             conninfo=database_url,
             min_size=min_size,
             max_size=max_size,
+            max_idle=180,
+            max_lifetime=1800,
             kwargs={"autocommit": True, "row_factory": dict_row},
             open=False,
         )
@@ -950,12 +964,19 @@ class TravelBackend:
         if self.pool is not None:
             await self.pool.close()
 
+    async def _ainvoke_with_retry(self, payload: Any, config: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return await self.graph.ainvoke(payload, config=config)
+        except PsycopgOperationalError as exc:
+            print(f"DB connection was stale, retrying once: {exc}")
+            return await self.graph.ainvoke(payload, config=config)
+
     async def run_travel_agent(self, user_input: str, thread_id: str | None = None) -> dict[str, Any]:
         if not thread_id:
             thread_id = f"user_{uuid.uuid4().hex}"
         config = {"configurable": {"thread_id": thread_id}}
 
-        result = await self.graph.ainvoke(
+        result = await self._ainvoke_with_retry(
             {
                 "messages": [HumanMessage(content=user_input)],
                 "user_query": user_input,
@@ -991,9 +1012,9 @@ class TravelBackend:
         if not thread_id:
             raise ValueError("thread_id is required to resume a travel plan.")
         config = {"configurable": {"thread_id": thread_id}}
-        result = await self.graph.ainvoke(
+        result = await self._ainvoke_with_retry(
             Command(resume={"approved": approved, "feedback": feedback.strip()}),
-            config=config,
+            config,
         )
         return _serialize_result(result, thread_id)
 
