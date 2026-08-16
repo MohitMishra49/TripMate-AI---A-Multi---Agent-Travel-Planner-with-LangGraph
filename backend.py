@@ -1,40 +1,3 @@
-"""
-backend_v2.py
-==============
-Production-style rewrite of backend.py.
-
-This is a NEW file. The original backend.py is untouched — swap the import
-in app.py (`from backend import ...` -> `from backend_v2 import ...`) once
-you've reviewed this and are ready to cut over, and adjust the routes to
-`await` the now-async entry points (see the notes at the bottom of this file).
-
-What changed vs. backend.py, and why, is explained in the chat response.
-Every change here maps directly to one of the 14 numbered requirements you
-gave me. Nothing in here fabricates flight prices, hotel prices, ratings,
-availability, or booking URLs — see AVIATIONSTACK CAPABILITY NOTE below.
-
-AVIATIONSTACK CAPABILITY NOTE (read this before assuming pricing works):
-Your mcp_client.py wires up the aviationstack-mcp server (Pradumnasaraf/
-aviationstack-mcp). Based on that server's documented tool set, it exposes
-reference/schedule data (list_airports, list_airlines, list_routes,
-historical_flights_by_date, airport schedules, flights_with_airline, etc.)
-via the free AviationStack API tier. It does NOT expose fare pricing,
-seat availability, or booking. There is no tool to invent here — the
-capability genuinely does not exist in this integration. This file uses
-list_routes / historical_flights_by_date (the two tools whose exact
-signatures I confirmed) for real route-specific data, and is explicit
-with the user, in the returned payload and in the final LLM prompt, that
-price/availability is not available and the booking link is a *search*
-link, not a quote.
-
-Tool discovery is done at RUNTIME against whatever the connected MCP
-server actually reports (`client.get_tools(server_name="aviationstack")`),
-rather than hardcoding tool names I can't verify against your installed
-version. If your server exposes additional/renamed tools, this code will
-pick up `list_routes` / `historical_flights_by_date` if present under
-those exact names, and will clearly report which ones it couldn't find.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -71,15 +34,10 @@ from mcp_client import client as mcp_client, tavily_mcp_search, weather_mcp_sear
 try:
     import airportsdata
     _IATA_AIRPORTS = airportsdata.load("IATA")
-except Exception:  # pragma: no cover - defensive, airportsdata is a listed dependency
+except Exception:
     _IATA_AIRPORTS = {}
 
 
-# =============================================================================
-# 1. Config / timeouts
-# =============================================================================
-
-# (Req #10) Nothing external gets to hang the whole request forever.
 LLM_TIMEOUT_SECONDS = 25
 MCP_TIMEOUT_SECONDS = 15
 
@@ -105,7 +63,6 @@ llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=GROQ_API_KEY)
 
 
 async def _llm_json(system_prompt: str, user_prompt: str, timeout: float = LLM_TIMEOUT_SECONDS) -> dict[str, Any]:
-    """Call the LLM and parse the first JSON object in its reply. Raises on failure/timeout."""
     response = await asyncio.wait_for(
         llm.ainvoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]),
         timeout=timeout,
@@ -125,14 +82,7 @@ async def _llm_text(system_prompt: str, user_prompt: str, timeout: float = LLM_T
     return str(response.content)
 
 
-# =============================================================================
-# 2. IATA lookup (Req #3) — real, offline, deterministic. No LLM guessing.
-# =============================================================================
-
 def resolve_iata(city_or_airport: str) -> str | None:
-    """Resolve a city/airport name to an IATA code using the airportsdata package
-    (already a project dependency). Returns None rather than guessing if no
-    confident match is found — callers must handle that explicitly."""
     if not city_or_airport:
         return None
 
@@ -154,10 +104,6 @@ def resolve_iata(city_or_airport: str) -> str | None:
         ]
     return matches[0] if matches else None
 
-
-# =============================================================================
-# 3. State (Req #8) — trip_constraints extended, single source of truth
-# =============================================================================
 
 class TripConstraints(TypedDict, total=False):
     origin: str
@@ -233,15 +179,6 @@ def _empty_constraints() -> TripConstraints:
     }
 
 
-# =============================================================================
-# 4. Supervisor + guardrail — MERGED INTO ONE LLM CALL (Req #9)
-# =============================================================================
-# The old code did two separate LLM calls here (guardrail, then supervisor).
-# They're independent asks of the same model over the same input, so they're
-# combined into a single structured call. This is the one place I removed an
-# LLM call outright rather than just parallelizing, because there's nothing
-# to run concurrently — it's the same input evaluated twice.
-
 SUPERVISOR_PROMPT = """
 You are the routing brain for a multi-agent travel-planning system. Do two
 things with the user's request below, and return ONLY strict JSON:
@@ -306,8 +243,6 @@ async def supervisor_agent(state: TravelState) -> dict[str, Any]:
         llm_calls += 1
     except Exception as exc:
         print(f"Supervisor fallback used: {exc}")
-        # Fail open, same philosophy as the original: don't let a parsing
-        # hiccup block a legitimate request.
         constraints = _empty_constraints()
         return {
             "guardrail_allowed": True,
@@ -370,13 +305,7 @@ def guardrail_blocked_agent(state: TravelState) -> dict[str, Any]:
     return {"final_response": reason, "messages": [AIMessage(content=reason)]}
 
 
-# =============================================================================
-# 5. Flight agent — REAL route-specific search (Req #3, #4, #5)
-# =============================================================================
-
 async def _discover_aviation_tools() -> dict[str, Any]:
-    """Ask the actual connected MCP server what it has, instead of assuming
-    tool names. Returns {tool_name: tool_object} for whatever is available."""
     tools = await asyncio.wait_for(
         mcp_client.get_tools(server_name="aviationstack"), timeout=MCP_TIMEOUT_SECONDS
     )
@@ -384,9 +313,6 @@ async def _discover_aviation_tools() -> dict[str, Any]:
 
 
 def _rank_flight_matches(matches: list[dict[str, Any]], constraints: TripConstraints) -> dict[str, Any]:
-    """Pure-Python ranking over REAL retrieved records. No price data exists
-    in this integration, so there is deliberately no 'cheapest' category —
-    see flight_limitations in the output instead of a fabricated one."""
     if not matches:
         return {"note": "No matching flight records were returned for this route."}
 
@@ -579,9 +505,6 @@ def _coerce_records(result: Any) -> list[dict[str, Any]]:
 def _build_flight_booking_links(
     origin_iata: str, destination_iata: str, origin_name: str, destination_name: str, departure_date: str
 ) -> dict[str, Any]:
-    """Constructed from Google Flights' publicly documented natural-language
-    query parameter (`q=`). This is a SEARCH link, not a price quote —
-    labeled as such so the final response can't misrepresent it."""
     query_bits = [f"Flights from {origin_name or origin_iata} to {destination_name or destination_iata}"]
     if departure_date:
         query_bits.append(f"on {departure_date}")
@@ -594,10 +517,6 @@ def _build_flight_booking_links(
         "disclaimer": "This opens a live search — it does not guarantee the price or availability shown.",
     }
 
-
-# =============================================================================
-# 6. Hotel agent — real Tavily results, structured extraction only (Req #6, #7)
-# =============================================================================
 
 HOTEL_EXTRACTION_PROMPT = """
 Below is raw web search text about hotels. Extract ONLY hotels that are
@@ -665,8 +584,6 @@ def _rank_hotel_candidates(hotels: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _build_hotel_booking_links(destination: str, checkin: str, checkout: str, travelers: int) -> dict[str, Any]:
-    """Booking.com's documented searchresults.html query structure — again,
-    a search link, not a confirmed price/availability."""
     params = [f"ss={(destination or '').replace(' ', '+')}"]
     if checkin:
         params.append(f"checkin={checkin}")
@@ -733,10 +650,6 @@ async def hotel_agent(state: TravelState) -> dict[str, Any]:
     }
 
 
-# =============================================================================
-# 7. Weather agent — NO extra LLM call (Req #8, #9): reuses trip_constraints
-# =============================================================================
-
 async def weather_agent(state: TravelState) -> dict[str, Any]:
     constraints = state.get("trip_constraints", {}) or {}
     city = constraints.get("destination") or ""
@@ -762,16 +675,6 @@ async def weather_agent(state: TravelState) -> dict[str, Any]:
 
     return {"weather_results": weather_results, "messages": [AIMessage(content="Weather information processed.")]}
 
-
-# =============================================================================
-# 8. Parallel data-agent node (Req #9) — flight/hotel/weather run concurrently
-# =============================================================================
-# The original graph chained agents one at a time via routing edges, which
-# made true concurrency impossible without a bigger restructure. Flight,
-# hotel, and weather don't depend on each other's output (only budget and
-# itinerary do), so this node runs the selected ones together with
-# asyncio.gather and isolates failures per-agent (Req #10) instead of one
-# slow agent blocking the others or a failure taking down the whole request.
 
 async def data_agents_node(state: TravelState) -> dict[str, Any]:
     selected = set(state.get("selected_agents", []))
@@ -813,10 +716,6 @@ async def data_agents_node(state: TravelState) -> dict[str, Any]:
     return merged
 
 
-# =============================================================================
-# 9. Budget agent — unchanged logic, now async, depends on data_agents_node
-# =============================================================================
-
 async def budget_agent(state: TravelState) -> dict[str, Any]:
     prompt = f"""
 Analyze whether this trip is realistic for the user's budget.
@@ -856,10 +755,6 @@ Do not state or imply a specific flight or hotel price as fact.
         "llm_calls": state.get("llm_calls", 0) + 1,
     }
 
-
-# =============================================================================
-# 10. Itinerary + HITL + final agent — same shape as before, now async
-# =============================================================================
 
 async def itinerary_agent(state: TravelState) -> dict[str, Any]:
     prompt = f"""
@@ -904,7 +799,6 @@ live pricing. Create a clear draft ready for human review.
 
 
 def human_approval_agent(state: TravelState) -> dict[str, Any]:
-    # interrupt() is not wrapped in try/except — LangGraph relies on it to pause.
     review = interrupt(
         {
             "question": "Do you approve this itinerary?",
@@ -993,10 +887,6 @@ Incorporate the human feedback when a revision was requested.
     }
 
 
-# =============================================================================
-# 11. Graph routing
-# =============================================================================
-
 def route_from_supervisor(state: TravelState) -> str:
     return "guardrail_blocked" if not state.get("guardrail_allowed", True) else "data_agents"
 
@@ -1005,10 +895,6 @@ def route_after_data_agents(state: TravelState) -> str:
     selected = set(state.get("selected_agents", []))
     return "budget_agent" if "budget_agent" in selected else "itinerary_agent"
 
-
-# =============================================================================
-# 12. Graph builder
-# =============================================================================
 
 def build_travel_graph(checkpointer: AsyncPostgresSaver):
     graph = StateGraph(TravelState)
@@ -1037,14 +923,7 @@ def build_travel_graph(checkpointer: AsyncPostgresSaver):
     return graph.compile(checkpointer=checkpointer)
 
 
-# =============================================================================
-# 13. Lifespan-managed backend (Req #1) — real pool, no global connection
-# =============================================================================
-
 class TravelBackend:
-    """Owns the connection pool, checkpointer, and compiled graph. One
-    instance per process, created/closed from FastAPI's lifespan so the pool
-    is opened and closed cleanly instead of leaking a bare global connection."""
 
     def __init__(self) -> None:
         self.pool: AsyncConnectionPool | None = None
@@ -1166,15 +1045,6 @@ def _serialize_result(result: dict[str, Any], thread_id: str) -> dict[str, Any]:
     }
 
 
-# =============================================================================
-# 14. Module-level singleton + FastAPI lifespan wiring
-# =============================================================================
-# app.py currently does `from backend import run_travel_agent, resume_travel_agent`
-# and calls them as plain sync functions. To use this file, app.py needs a
-# small update — see the notes at the very bottom of this file. It's a few
-# lines, not a rewrite, and I've left it out of this file on purpose since
-# you asked specifically for the backend file.
-
 _backend: TravelBackend | None = None
 
 
@@ -1203,40 +1073,8 @@ def get_travel_backend() -> TravelBackend:
 
 
 async def run_travel_agent(user_input: str, thread_id: str | None = None) -> dict[str, Any]:
-    """Async drop-in replacement for the old sync `run_travel_agent`."""
     return await get_travel_backend().run_travel_agent(user_input, thread_id)
 
 
 async def resume_travel_agent(thread_id: str, approved: bool, feedback: str = "") -> dict[str, Any]:
-    """Async drop-in replacement for the old sync `resume_travel_agent`."""
     return await get_travel_backend().resume_travel_agent(thread_id, approved, feedback)
-
-
-# =============================================================================
-# app.py CHANGES NEEDED TO USE THIS FILE (not applied here — you asked for
-# backend only). Three small changes:
-#
-# 1. Add a lifespan handler:
-#
-#    from contextlib import asynccontextmanager
-#    from backend_v2 import init_travel_backend, close_travel_backend
-#
-#    @asynccontextmanager
-#    async def lifespan(app: FastAPI):
-#        await init_travel_backend()
-#        yield
-#        await close_travel_backend()
-#
-#    app = FastAPI(..., lifespan=lifespan)
-#
-# 2. Change the import:
-#    from backend_v2 import run_travel_agent, resume_travel_agent
-#
-# 3. Await the calls (they're already inside `async def` routes, so this is
-#    just adding `await`):
-#    result = await run_travel_agent(user_input=user_message, thread_id=request_data.thread_id)
-#    result = await resume_travel_agent(thread_id=..., approved=..., feedback=...)
-#
-# Also drop `import nest_asyncio` / `nest_asyncio.apply()` from app.py — it's
-# no longer needed since nothing calls asyncio.run() inside a running loop.
-# =============================================================================

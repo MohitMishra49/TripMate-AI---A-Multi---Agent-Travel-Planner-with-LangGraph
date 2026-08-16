@@ -1,26 +1,3 @@
-"""
-app_v2.py
-=========
-New FastAPI entry point that uses backend_v2 (async graph, pooled Postgres
-connection) instead of backend.py. app.py is untouched.
-
-Only three things actually changed vs. app.py:
-  1. `nest_asyncio` is gone — nothing needs it anymore, since backend_v2
-     never calls asyncio.run() from inside a running event loop.
-  2. A `lifespan` context manager opens the connection pool once at startup
-     and closes it once at shutdown, instead of backend.py's global
-     connection that opened at import time and never closed.
-  3. The two routes `await` the now-async `run_travel_agent` /
-     `resume_travel_agent` instead of calling them as blocking sync calls.
-
-Everything else (routes, request/response models, templates, static
-mounting) is identical to app.py on purpose — this is a swap of the
-execution model, not a rewrite of the API surface.
-
-To run this instead of app.py:
-    uvicorn app_v2:app --reload
-"""
-
 from contextlib import asynccontextmanager
 from pathlib import Path
 import traceback
@@ -39,10 +16,6 @@ BASE_DIR = Path(__file__).resolve().parent
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Opens the AsyncConnectionPool + runs checkpointer.setup() once, here,
-    # instead of at import time. This is also where you'd add any other
-    # startup/shutdown resources later.
-    await init_travel_backend()
     try:
         yield
     finally:
