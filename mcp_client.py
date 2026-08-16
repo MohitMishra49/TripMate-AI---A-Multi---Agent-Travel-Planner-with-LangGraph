@@ -8,6 +8,7 @@ import certifi
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_mcp_adapters.client import MultiServerMCPClient
+UVX_COMMAND = os.getenv("UVX_COMMAND", "uvx")
 
 
 BASE_DIR = Path(__file__).resolve().parent
