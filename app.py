@@ -16,6 +16,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    await init_travel_backend()
     try:
         yield
     finally:
