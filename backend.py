@@ -46,6 +46,11 @@ MCP_TIMEOUT_SECONDS = 15
 # next request. The shared 15s MCP_TIMEOUT_SECONDS isn't enough for that --
 # give weather its own longer budget instead of tightening the others.
 WEATHER_TIMEOUT_SECONDS = 50
+# Itinerary generation produces the longest output of any agent (a full
+# day-by-day plan) and runs after every other agent has already finished, so
+# it's the most likely place to run into Groq rate-limit backoff/retries
+# eating into the timeout budget. Give it more room than the default.
+ITINERARY_TIMEOUT_SECONDS = 60
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 if not GROQ_API_KEY:
@@ -795,7 +800,16 @@ Make the itinerary practical and easy to follow. Do not state a flight or
 hotel price as confirmed fact — point the user to the booking links for
 live pricing. Create a clear draft ready for human review.
 """
-    text = await _llm_text("You are an expert travel planner.", prompt)
+    try:
+        text = await _llm_text(
+            "You are an expert travel planner.", prompt, timeout=ITINERARY_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        text = (
+            "The itinerary generator timed out before finishing. This can happen "
+            "with very detailed multi-day requests. Please try again, or ask for "
+            "a shorter/simpler itinerary."
+        )
 
     approval_request = (
         "Please review the generated draft itinerary. Approve it to create the "
