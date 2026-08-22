@@ -71,7 +71,7 @@ def get_database_url() -> str:
     return database_url
 
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", api_key=GROQ_API_KEY)
+llm = ChatGroq(model="openai/gpt-oss-120b", api_key=GROQ_API_KEY)
 
 
 async def _llm_json(system_prompt: str, user_prompt: str, timeout: float = LLM_TIMEOUT_SECONDS) -> dict[str, Any]:
